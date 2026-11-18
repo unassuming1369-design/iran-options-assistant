@@ -1,12 +1,10 @@
 {
   "name": "iran-options-assistant",
-  "version": "1.0.0",
-  "description": "Iran options trading Telegram assistant",
+  "version": "3.2.0",
+  "private": true,
+  "description": "Telegram diagnostic assistant for TSETMC option-chain data",
   "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "express": "^4.21.2"
-  }
+  "scripts": { "start": "node index.js" },
+  "engines": { "node": ">=18" },
+  "dependencies": { "express": "^4.21.2" }
 }
