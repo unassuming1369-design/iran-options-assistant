@@ -1,10 +1,17 @@
 {
   "name": "iran-options-assistant",
-  "version": "3.2.0",
+  "version": "4.1.0",
   "private": true,
-  "description": "Telegram diagnostic assistant for TSETMC option-chain data",
+  "description": "Persian Telegram options analysis assistant powered by TSETMC public market data",
   "main": "index.js",
-  "scripts": { "start": "node index.js" },
-  "engines": { "node": ">=18" },
-  "dependencies": { "express": "^4.21.2" }
+  "scripts": {
+    "start": "node index.js",
+    "test": "node tests/selftest.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
 }

@@ -1,198 +1,405 @@
 'use strict';
 
 const express = require('express');
+const fs = require('node:fs');
+const path = require('node:path');
+const core = require('./core');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
-
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const SECRET = process.env.WEBHOOK_SECRET;
 const PORT = Number(process.env.PORT || 10000);
-const TSETMC_URL = 'https://cdn.tsetmc.com/api/Instrument/GetInstrumentOptionMarketWatch/1';
+const VERSION = '4.1.0';
+const CAPITAL_TOMAN = Number(process.env.CAPITAL_TOMAN || 5000000);
+const MAX_RISK_PCT = Math.min(0.01, Math.max(0, Number(process.env.MAX_RISK_PCT || 0.01)));
+const RAW_RISK_PCT = Number(process.env.RISK_PER_TRADE_PCT || 0.005);
+const RISK_PCT = Math.min(Number.isFinite(RAW_RISK_PCT) ? Math.max(0, RAW_RISK_PCT) : 0.005, MAX_RISK_PCT);
+const RAW_MIN_RR = Number(process.env.MIN_RR || 2);
+const MIN_RR = Number.isFinite(RAW_MIN_RR) ? Math.max(2, RAW_MIN_RR) : 2;
+const RAW_RFR = process.env.RISK_FREE_RATE === undefined || process.env.RISK_FREE_RATE === '' ? null : Number(process.env.RISK_FREE_RATE);
+const RISK_FREE_RATE = Number.isFinite(RAW_RFR) && RAW_RFR >= 0 && RAW_RFR <= 1.5 ? RAW_RFR : null;
+const ALLOWED_CHAT_IDS = (process.env.TELEGRAM_ALLOWED_CHAT_IDS || '').split(',').map(x => x.trim()).filter(Boolean);
 const STARTED_AT = new Date();
 
-let lastFetchAt = null;
-let lastFetchError = null;
-let lastRawCount = 0;
-let lastCandidates = [];
-let lastRootKeys = [];
-let lastFetchDurationMs = null;
-let cache = null;
-let cacheAt = 0;
-const CACHE_MS = 15000;
+let lastMarket = null;
+let lastMarketError = null;
+let lastMarketAt = null;
+let lastUpdateAt = null;
+const oiSnapshots = new Map();
+const SNAPSHOT_FILE = path.join(__dirname, 'data', 'oi_history.json');
 
-function walk(value, path = '$', out = [], depth = 0) {
-  if (depth > 12 || value == null) return out;
-  if (Array.isArray(value)) {
-    if (value.length && value.every(x => x && typeof x === 'object' && !Array.isArray(x))) {
-      const keys = [...new Set(value.slice(0, 8).flatMap(x => Object.keys(x)))].sort();
-      out.push({ path, count: value.length, keys, sample: value.slice(0, 2) });
-    }
-    value.slice(0, 2000).forEach((v, i) => walk(v, `${path}[${i}]`, out, depth + 1));
-  } else if (typeof value === 'object') {
-    for (const [k, v] of Object.entries(value)) walk(v, `${path}.${k}`, out, depth + 1);
-  }
-  return out;
-}
-
-function findArrays(payload) {
-  const found = walk(payload);
-  // Prefer the largest object-array candidates; do not assume they are option contracts.
-  return found.sort((a, b) => b.count - a.count).slice(0, 8);
-}
-
-async function getMarket(force = false) {
-  if (!force && cache && Date.now() - cacheAt < CACHE_MS) return cache;
-  const started = Date.now();
+function safeNumber(n) { return Number.isFinite(Number(n)) ? Number(n) : null; }
+function cacheFileLoad() {
   try {
-    const response = await fetch(TSETMC_URL, {
-      headers: { 'accept': 'application/json', 'user-agent': 'DastyarOption/3.2' },
-      signal: AbortSignal.timeout(20000)
-    });
-    if (!response.ok) throw new Error(`TSETMC HTTP ${response.status}`);
-    const payload = await response.json();
-    const candidates = findArrays(payload);
-    const largest = candidates[0];
-    lastRootKeys = payload && typeof payload === 'object' && !Array.isArray(payload) ? Object.keys(payload) : [];
-    lastCandidates = candidates;
-    lastRawCount = largest ? largest.count : (Array.isArray(payload) ? payload.length : 0);
-    lastFetchAt = new Date();
-    lastFetchError = null;
-    lastFetchDurationMs = Date.now() - started;
-    cache = { payload, candidates, count: lastRawCount };
-    cacheAt = Date.now();
-    return cache;
-  } catch (err) {
-    lastFetchError = err.message || String(err);
-    lastFetchDurationMs = Date.now() - started;
-    throw err;
+    if (!fs.existsSync(SNAPSHOT_FILE)) return;
+    const rows = JSON.parse(fs.readFileSync(SNAPSHOT_FILE, 'utf8'));
+    for (const [k, v] of Object.entries(rows)) oiSnapshots.set(k, v);
+  } catch (e) { console.warn('OI snapshot history not loaded:', e.message); }
+}
+function cacheFileSave() {
+  try {
+    fs.mkdirSync(path.dirname(SNAPSHOT_FILE), { recursive: true });
+    const obj = Object.fromEntries(oiSnapshots.entries());
+    fs.writeFileSync(SNAPSHOT_FILE, JSON.stringify(obj));
+  } catch (e) { console.warn('OI snapshot history not saved:', e.message); }
+}
+cacheFileLoad();
+
+function trackOpenInterest(options) {
+  const now = Date.now();
+  for (const o of options || []) {
+    const identity = o.insCode || o.isin;
+    if (!identity || o.openInterest == null) continue;
+    const old = oiSnapshots.get(identity);
+    o.openInterestChange = old && Number.isFinite(old.value) ? o.openInterest - old.value : null;
+    o.openInterestObservedMinutes = old ? Math.max(0, (now - old.at) / 60000) : null;
+    oiSnapshots.set(identity, { value: o.openInterest, at: now });
   }
-}
-
-function dateText(d) {
-  if (!d) return 'هنوز دریافت نشده';
-  return new Date(d).toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' });
-}
-
-function statusText() {
-  return [
-    'وضعیت سامانه: فعال',
-    'نسخه: 3.2 (تشخیص ساختار)',
-    `TSETMC flow: ${lastFetchAt ? 'دریافت موفق' : 'هنوز دریافت نشده'}`,
-    `آخرین دریافت: ${dateText(lastFetchAt)}`,
-    `تعداد رکورد خام: ${lastRawCount || 'نامشخص'}`,
-    `زمان پاسخ منبع: ${lastFetchDurationMs == null ? 'نامشخص' : lastFetchDurationMs + ' ms'}`,
-    `خطای آخر: ${lastFetchError || 'ندارد'}`,
-    'مدل زبانی: غیرفعال',
-    'سرمایه مبنا: ۵,۰۰۰,۰۰۰ تومان | ریسک هدف: ۰٫۵٪ | سقف ریسک: ۱٪',
-    'حالت فعلی: تحلیل تشخیصی؛ تا تأیید ساختار قراردادها سیگنال صادر نمی‌شود.'
-  ].join('\n');
-}
-
-function debugText() {
-  if (!lastCandidates.length) return 'هنوز داده‌ای برای بررسی ساختار دریافت نشده است. ابتدا /market را بزن.';
-  const lines = ['گزارش ساختار خام TSETMC (نمونه محدود):'];
-  for (const c of lastCandidates.slice(0, 5)) {
-    lines.push(`\nمسیر: ${c.path}\nتعداد: ${c.count}\nکلیدها: ${c.keys.join(', ') || 'ندارد'}`);
-    const sample = c.sample && c.sample[0];
-    if (sample) {
-      const compact = {};
-      for (const [k, v] of Object.entries(sample).slice(0, 18)) {
-        compact[k] = typeof v === 'object' && v !== null ? (Array.isArray(v) ? `[array:${v.length}]` : '[object]') : v;
-      }
-      lines.push('نمونه رکورد: ' + JSON.stringify(compact).slice(0, 1000));
-    }
-  }
-  return lines.join('\n').slice(0, 3900);
+  cacheFileSave();
+  return options;
 }
 
 async function telegram(method, body) {
-  if (!TOKEN) throw new Error('TELEGRAM_BOT_TOKEN تنظیم نشده است.');
-  const r = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
+  if (!TOKEN) throw new Error('متغیر TELEGRAM_BOT_TOKEN در Render تنظیم نشده است.');
+  const response = await fetch(`https://api.telegram.org/bot${TOKEN}/${method}`, {
     method: 'POST', headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body), signal: AbortSignal.timeout(15000)
+    body: JSON.stringify(body), signal: AbortSignal.timeout(15000),
   });
-  const data = await r.json().catch(() => ({}));
-  if (!r.ok || !data.ok) throw new Error(data.description || `Telegram HTTP ${r.status}`);
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) throw new Error(data.description || `Telegram HTTP ${response.status}`);
   return data;
 }
 
 async function reply(chatId, text) {
-  // Telegram message limit is 4096 characters.
-  const chunks = String(text).match(/[\s\S]{1,3900}/g) || [''];
+  const chunks = String(text || '').match(/[\s\S]{1,3900}/g) || [''];
   for (const chunk of chunks) await telegram('sendMessage', { chat_id: chatId, text: chunk, disable_web_page_preview: true });
+}
+
+async function safeFetch(path, keys) {
+  try { return await core.fetchJson(path, { cacheMs: 120000 }); }
+  catch (e) { return { __error: e.message }; }
+}
+
+async function getMarket(force = false) {
+  if (!force && lastMarket && Date.now() - lastMarketAt < 12000) return lastMarket;
+  try {
+    const result = await core.getOptionMarket(force);
+    if (!result.options.length) {
+      const fields = result.selected ? result.selected.keys.join(', ') : 'هیچ آرایه‌ای پیدا نشد';
+      throw new Error(`داده دریافت شد اما ساختار قراردادها شناسایی نشد. فیلدهای قابل مشاهده: ${fields}`);
+    }
+    trackOpenInterest(result.options);
+    lastMarket = result; lastMarketAt = Date.now(); lastMarketError = null;
+    return result;
+  } catch (e) { lastMarketError = e.message; throw e; }
+}
+
+function baseInfoFromGroup(group) {
+  const firstOption = group.options[0] || {};
+  return { code: group.code || firstOption.underlyingCode, ticker: group.ticker || firstOption.underlyingTicker, name: group.name || firstOption.underlyingName, rowSpot: firstOption.spot };
+}
+
+async function resolveUnderlying(symbol, market) {
+  let group = core.findUnderlyingGroup(market.options, symbol);
+  if (group && group.code && /^\d+$/.test(String(group.code))) return { group, base: baseInfoFromGroup(group), search: null };
+  const searchRaw = await safeFetch(`/Instrument/GetInstrumentSearch/${encodeURIComponent(symbol)}`);
+  if (searchRaw.__error) return { group: null, base: null, searchError: searchRaw.__error };
+  const matches = core.findArrayByKey(searchRaw, ['instrumentSearch', 'instruments', 'result']);
+  const q = core.normalizeSymbol(symbol);
+  const found = matches.find(x => core.normalizeSymbol(x.lVal18AFC) === q)
+    || matches.find(x => core.normalizeSymbol(x.lVal30).includes(q) || core.normalizeSymbol(x.lVal18AFC).includes(q));
+  if (!found) return { group: null, base: null, searchError: 'نماد در فهرست نمادهای پایه یا زنجیره اختیار پیدا نشد.' };
+  const code = String(found.insCode || '');
+  group = market.options.filter(o => o.underlyingCode === code || core.normalizeSymbol(o.underlyingTicker) === core.normalizeSymbol(found.lVal18AFC));
+  const g = group.length ? { code, ticker: found.lVal18AFC, name: found.lVal30, options: group, totalValue: group.reduce((s, o) => s + (o.value || 0), 0), totalVolume: group.reduce((s, o) => s + (o.volume || 0), 0) } : null;
+  return { group: g, base: { code, ticker: found.lVal18AFC, name: found.lVal30, rowSpot: null }, search: found };
+}
+
+async function enrichWithOrderBooks(options) {
+  const targets = [...options].filter(o => o.insCode).sort((a, b) => (b.volume || 0) - (a.volume || 0)).slice(0, 6);
+  const byCode = new Map();
+  for (const option of targets) {
+    const raw = await safeFetch(`/BestLimits/${option.insCode}`);
+    if (raw.__error) continue;
+    const book = core.extractBestLimits(raw);
+    if (book.available) byCode.set(option.insCode, book);
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  return options.map(o => {
+    const book = byCode.get(o.insCode);
+    if (!book) return o;
+    return { ...o, bid: book.bestBid ?? o.bid, bidVolume: book.bestBidVolume ?? o.bidVolume, ask: book.bestAsk ?? o.ask, askVolume: book.bestAskVolume ?? o.askVolume, book };
+  });
+}
+
+async function analyzeSymbol(symbol) {
+  const market = await getMarket();
+  const resolved = await resolveUnderlying(symbol, market);
+  if (!resolved.base || !resolved.base.code) return { error: resolved.searchError || 'نماد پایه پیدا نشد.', market };
+  const base = resolved.base;
+  const code = base.code;
+  const [quoteRaw, historyRaw, infoRaw, flowRaw, newsRaw, codalRaw] = await Promise.all([
+    safeFetch(`/ClosingPrice/GetClosingPriceInfo/${code}`),
+    safeFetch(`/ClosingPrice/GetClosingPriceDailyList/${code}/120`),
+    safeFetch(`/Instrument/GetInstrumentInfo/${code}`),
+    safeFetch(`/ClientType/GetClientType/${code}/1/0`),
+    safeFetch(`/Msg/GetMsgByInsCode/${code}`),
+    safeFetch(`/Codal/GetPreparedDataByInsCode/9/${code}`),
+  ]);
+  const quote = quoteRaw.__error ? null : core.extractPriceInfo(quoteRaw);
+  const history = historyRaw.__error ? [] : core.findArrayByKey(historyRaw, ['closingPriceDaily', 'closingPrice', 'history']);
+  const technical = core.analyzeTechnical(history);
+  const fundamentals = infoRaw.__error ? { available: false } : core.extractFundamentals(infoRaw);
+  const flow = flowRaw.__error ? { available: false, error: flowRaw.__error } : core.extractClientFlow(flowRaw);
+  const news = newsRaw.__error ? [] : core.extractMessages(newsRaw);
+  const codal = codalRaw.__error ? [] : core.extractMessages(codalRaw);
+  const spot = (quote && (quote.last || quote.close)) || (base.rowSpot > 0 ? base.rowSpot : null) || (market.options.find(o => o.underlyingCode === code && o.spot > 0)?.spot) || (technical.available ? technical.lastClose : null);
+  const spotSource = quote && (quote.last || quote.close) ? 'تابلوی قیمت TSETMC' : base.rowSpot > 0 ? 'رکورد زنجیره اختیار' : 'تاریخچه قیمت';
+  const contractOptions = (resolved.group?.options || market.options.filter(o => o.underlyingCode === code));
+  const withBooks = await enrichWithOrderBooks(contractOptions);
+  const enriched = core.enrichOptions(withBooks, spot, Number.isFinite(RISK_FREE_RATE) ? RISK_FREE_RATE : null);
+  const riskBudget = Math.max(0, CAPITAL_TOMAN * RISK_PCT);
+  const compatibleDirection = technical.available ? technical.direction : 'نامشخص';
+  const longCandidates = enriched.map(o => core.calcLongOptionCandidate(o, compatibleDirection, technical, spot, riskBudget, o.contractSize, MIN_RR)).filter(Boolean).sort((a, b) => b.rr - a.rr).slice(0, 2);
+  const spreads = technical.available ? core.calcDebitSpreads(enriched, compatibleDirection, riskBudget, MIN_RR) : [];
+  const straddles = technical.available ? core.calcLongStraddles(enriched, technical, riskBudget, MIN_RR) : [];
+  const sortedLiquidity = enriched.map(o => ({ ...o, quality: core.optionQuality(o).score })).sort((a, b) => b.quality - a.quality).slice(0, 5);
+  return {
+    symbol: base.ticker || symbol, name: base.name, code, spot, spotSource, quote,
+    technical, fundamentals, flow, news, codal, options: enriched, sortedLiquidity,
+    longCandidates, spreads, straddles, ratios: core.putCallRatios(enriched), sentiment: core.scoreNewsSentiment(news.concat(codal)), fetchedAt: market.fetchedAt, market,
+    errors: { quote: quoteRaw.__error, history: historyRaw.__error, info: infoRaw.__error, flow: flowRaw.__error, news: newsRaw.__error, codal: codalRaw.__error },
+  };
+}
+
+function buildAnalysisText(a) {
+  if (a.error) return `تحلیل نماد انجام نشد\nدلیل: ${a.error}\n\nبرای بررسی فهرست نمادها /market را بزن.`;
+  const lines = [
+    `گزارش بررسی ${a.symbol}${a.name ? ` ـ ${a.name}` : ''}`,
+    `زمان دریافت داده: ${a.fetchedAt.toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' })}`,
+    `منبع زنجیره اختیار: ${a.market?.source || 'نامشخص'}`,
+    `قیمت سهم پایه: ${core.toman(a.spot)} (${a.spotSource})`,
+    `زمان ثبت قیمت پایه در منبع: ${a.quote?.date || a.quote?.time ? `${a.quote.date || 'تاریخ نامشخص'} ${a.quote.time || ''}` : 'منبع زمان مستقل آخرین معامله را اعلام نکرده است'}` ,
+    'زمان دریافت ربات با زمان آخرین معامله یکی نیست؛ در صورت تأخیر منبع، قیمت را پیش از ورود در تابلوی کارگزاری هم کنترل کن.',
+    '', '۱) وضعیت تکنیکال', core.directionExplanation(a.technical),
+    '', '۲) وضعیت بنیادی',
+  ];
+  if (a.fundamentals.available) {
+    lines.push(`EPS: ${core.formatNumber(a.fundamentals.eps)} | نسبت P/E: ${core.formatNumber(a.fundamentals.pe, 2)} | P/E گروه: ${core.formatNumber(a.fundamentals.sectorPe, 2)}`);
+    if (a.fundamentals.sector) lines.push(`گروه: ${a.fundamentals.sector}`);
+    lines.push('این بخش فقط فیلدهای موجود در اطلاعات نماد را نشان می‌دهد؛ تحلیل صورت‌های مالی کامل نیست.');
+  } else lines.push('اطلاعات بنیادی کافی از سرویس نماد دریافت نشد؛ نتیجه بنیادی صادر نمی‌شود.');
+  lines.push('', '۳) جریان خرید و فروش حقیقی/حقوقی', core.summarizeFlow(a.flow));
+  lines.push('', '۴) وضعیت زنجیره اختیار',
+    `تعداد قراردادهای شناسایی‌شده: ${core.formatNumber(a.options.length)} (خرید: ${core.formatNumber(a.options.filter(o => o.type === 'call').length)}، فروش: ${core.formatNumber(a.options.filter(o => o.type === 'put').length)})`,
+    `تاریخ داخل رکوردها: ${core.getOptionFreshness(a.options)}`,
+    `نسبت حجم فروش به خرید (PCR): ${a.ratios.volume == null ? 'قابل محاسبه نیست' : core.formatNumber(a.ratios.volume, 2)} | نسبت ارزش: ${a.ratios.value == null ? 'قابل محاسبه نیست' : core.formatNumber(a.ratios.value, 2)} | نسبت موقعیت باز: ${a.ratios.openInterest == null ? 'داده کافی ندارد' : core.formatNumber(a.ratios.openInterest, 2)}`,
+    'نسبت PCR فقط مقایسه حجم/ارزش/موقعیت باز Put با Call است و به‌تنهایی جهت بازار را مشخص نمی‌کند.');
+  if (a.sortedLiquidity.length) {
+    lines.push('قراردادهای با نقدشوندگی بهتر برای بررسی:');
+    for (const o of a.sortedLiquidity.slice(0, 4)) {
+      const oi = o.openInterestChange == null ? 'تغییر موقعیت باز: سابقه مقایسه نداریم' : `تغییر موقعیت باز از دریافت قبلی: ${o.openInterestChange > 0 ? '+' : ''}${core.formatNumber(o.openInterestChange)}`;
+      const depth = o.book?.imbalance == null ? '' : ` | برتری سفارش خرید/فروش: ${core.formatNumber(o.book.imbalance * 100, 1)}٪`;
+      lines.push(`• ${o.typeFa} ${o.ticker} | قیمت اعمال ${core.toman(o.strike)} | روز مانده ${core.formatNumber(o.daysRemaining)} | حجم ${core.formatNumber(o.volume)} | فاصله عرضه/تقاضا ${o.spreadPct == null ? 'نامشخص' : `${core.formatNumber(o.spreadPct, 1)}٪`} | ${oi}${depth}`);
+    }
+  } else lines.push('قرارداد قابل رتبه‌بندی از نظر نقدشوندگی شناسایی نشد.');
+  lines.push('', '۵) بررسی موقعیت و ریسک');
+  if (a.longCandidates.length || a.spreads.length || a.straddles.length) {
+    for (const c of a.longCandidates) lines.push(`• ${c.strategy}: ${c.option.ticker} | تعداد مجاز با ریسک هدف: ${core.formatNumber(c.quantity)} قرارداد | زیان حداکثری برآوردی: ${core.formatNumber(c.maxLoss)} تومان | سود سناریوی هدف: ${core.formatNumber(c.targetProfit)} تومان | نسبت سود به زیان: ۱ به ${core.formatNumber(c.rr, 2)}`);
+    for (const s of a.spreads) lines.push(`• ${s.strategy}: خرید ${s.buy.ticker} و فروش ${s.sell.ticker} | تعداد: ${core.formatNumber(s.quantity)} | حداکثر زیان: ${core.formatNumber(s.maxLoss)} تومان | حداکثر سود: ${core.formatNumber(s.maxProfit)} تومان | نسبت سود به زیان: ۱ به ${core.formatNumber(s.rr, 2)}`);
+    for (const s of a.straddles) lines.push(`• ${s.strategy}: ${s.scenario} تا محدوده ${core.toman(s.target)} | خرید ${s.call.ticker} + ${s.put.ticker} | تعداد: ${core.formatNumber(s.quantity)} جفت | حداکثر زیان: ${core.formatNumber(s.maxLoss)} تومان | سود این سناریو: ${core.formatNumber(s.targetProfit)} تومان | نسبت سود به زیان: ۱ به ${core.formatNumber(s.rr, 2)}`);
+  } else {
+    lines.push('در حال حاضر موقعیتی که هم‌زمان شرایط روند، نقدشوندگی، اطلاعات قیمت و نسبت سود به زیان حداقل ۱ به ۲ را داشته باشد پیدا نشد.');
+    lines.push('نتیجه: عدم معامله؛ دنبال‌کردن معامله ضعیف بهتر از ورود اجباری نیست.');
+  }
+  lines.push('', '۶) اخبار و اطلاعیه‌ها');
+  if (a.news.length) for (const n of a.news.slice(0, 3)) lines.push(`• ${n.title}${n.date ? ` ـ ${n.date}` : ''}`);
+  else lines.push('پیام ناظر مرتبط از سرویس TSETMC دریافت نشد. این به معنی نبود خبر در همه منابع نیست.');
+  if (a.codal.length) {
+    lines.push('آخرین موارد کدال:');
+    for (const c of a.codal.slice(0, 3)) lines.push(`• ${c.title}${c.date ? ` ـ ${c.date}` : ''}`);
+  } else lines.push('اطلاعیه قابل استخراج کدال از مسیر عمومی TSETMC در این دریافت به دست نیامد.');
+  lines.push(`جمع‌بندی کلیدواژه‌ای خبرها: ${a.sentiment.label} (مثبت: ${a.sentiment.positiveHits}، منفی: ${a.sentiment.negativeHits})`);
+  lines.push('این برچسب فقط غربال اولیه واژه‌هاست و تحلیل معنایی/تأیید خبر محسوب نمی‌شود.');
+  lines.push('', 'یادآوری مهم:',
+    `سرمایه مبنا ${core.formatNumber(CAPITAL_TOMAN)} تومان است؛ ریسک هدف هر معامله ${core.formatNumber(RISK_PCT * 100, 2)}٪ (${core.formatNumber(riskBudgetForText())} تومان) و سقف سخت ریسک ${core.formatNumber(MAX_RISK_PCT * 100, 2)}٪ است.`,
+    'محاسبه سود اختیارهای تکی در قیمت هدف، ارزش ذاتی در سررسید را می‌سنجد و ارزش زمانی، تغییر نوسان ضمنی، کارمزد، صف سفارش و لغزش قیمت را تضمین نمی‌کند.',
+    'یونانی‌ها و نوسان ضمنی فقط وقتی محاسبه می‌شوند که نرخ بدون ریسک در Render به‌صورت معتبر تنظیم شده باشد؛ این محاسبات نیز با فرض مدل اروپایی تقریبی‌اند.',
+    'تغییر موقعیت باز با مقایسه آخرین دریافت ربات محاسبه می‌شود؛ پس از Deploy یا خاموش/روشن‌شدن سرویس Render ممکن است سابقه مقایسه از دست برود.');
+  const failedParts = Object.entries(a.errors).filter(([, v]) => v).map(([k]) => ({ quote: 'قیمت سهم', history: 'تاریخچه قیمت', info: 'اطلاعات بنیادی', flow: 'جریان حقیقی/حقوقی', news: 'پیام ناظر', codal: 'اطلاعیه کدال' }[k]));
+  if (failedParts.length) lines.push('', `بخش‌هایی که منبعشان پاسخ نداد: ${failedParts.join('، ')}. نتیجه این بخش‌ها در تحلیل وارد نشده است.`);
+  return lines.join('\n');
+}
+function riskBudgetForText() { return CAPITAL_TOMAN * RISK_PCT; }
+
+function buildMarketText(market) {
+  const opts = market.options;
+  const calls = opts.filter(o => o.type === 'call'), puts = opts.filter(o => o.type === 'put');
+  const groups = core.groupOptionsByUnderlying(opts).filter(g => g.ticker);
+  const top = groups.sort((a, b) => b.totalValue - a.totalValue).slice(0, 8);
+  const topOpts = [...opts].sort((a, b) => (b.value || 0) - (a.value || 0)).slice(0, 7);
+  const lines = [
+    'نمای کلی بازار اختیار معامله',
+    `زمان دریافت: ${market.fetchedAt.toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' })}`,
+    `منبع داده: ${market.source || 'TSETMC'}`,
+    `تعداد قراردادهای شناسایی‌شده: ${core.formatNumber(opts.length)}`,
+    `اختیار خرید: ${core.formatNumber(calls.length)} | اختیار فروش: ${core.formatNumber(puts.length)}`,
+    `دارایی‌های پایه شناسایی‌شده: ${core.formatNumber(groups.length)}`,
+    core.getOptionFreshness(opts),
+    `نسبت حجم Put به Call در کل بازار: ${core.putCallRatios(opts).volume == null ? 'نامشخص' : core.formatNumber(core.putCallRatios(opts).volume, 2)}`,
+    '', 'نمادهای پایه با بیشترین ارزش معاملات اختیار:'
+  ];
+  for (const g of top) lines.push(`• ${g.ticker} | ارزش ثبت‌شده مجموع: ${core.toman(g.totalValue)} | حجم مجموع: ${core.formatNumber(g.totalVolume)}`);
+  lines.push('', 'قراردادهای با بیشترین ارزش معاملات:');
+  for (const o of topOpts) lines.push(`• ${o.ticker} (${o.typeFa}) | ${core.toman(o.value)} | حجم ${core.formatNumber(o.volume)} | سررسید ${o.endDate || 'نامشخص'}`);
+  lines.push('', 'برای گزارش کامل یک نماد، دستور /analyze نام‌نماد را بفرست؛ مثلاً /analyze فولاد.');
+  return lines.join('\n');
+}
+
+function buildChainText(symbol, options) {
+  const q = core.normalizeSymbol(symbol);
+  const filtered = options.filter(o => core.normalizeSymbol(o.underlyingTicker).includes(q) || core.normalizeSymbol(o.underlyingName).includes(q) || o.underlyingCode === symbol);
+  if (!filtered.length) return `برای «${symbol}» قراردادی در زنجیره فعلی پیدا نشد. نام نماد پایه را دقیق‌تر وارد کن.`;
+  const lines = [`زنجیره اختیار نماد ${filtered[0].underlyingTicker || symbol}`, `تعداد قراردادها: ${core.formatNumber(filtered.length)}`, ''];
+  for (const o of filtered.sort((a, b) => (a.daysRemaining ?? 9999) - (b.daysRemaining ?? 9999)).slice(0, 18)) lines.push(core.summarizeOption(o), '────────────');
+  return lines.join('\n').slice(0, 3800);
+}
+
+function buildScanText(market) {
+  const groups = core.groupOptionsByUnderlying(market.options).filter(g => g.ticker).sort((a, b) => b.totalValue - a.totalValue).slice(0, 10);
+  if (!groups.length) return 'نماد پایه‌ای برای اسکن پیدا نشد.';
+  return ['اسکن اولیه بازار اختیار', 'این فهرست بر اساس ارزش معاملات ثبت‌شده زنجیره مرتب شده؛ به‌تنهایی سیگنال خرید نیست.', '', ...groups.map((g, i) => `${i + 1}) ${g.ticker} | ارزش مجموع اختیارها ${core.toman(g.totalValue)} | حجم ${core.formatNumber(g.totalVolume)} | ${core.formatNumber(g.options.length)} قرارداد`), '', 'برای تحلیل کامل هر نماد: /analyze نام‌نماد'].join('\n');
+}
+
+function buildNewsText(symbol, news) {
+  if (!news.length) return `برای «${symbol}» پیام ناظر قابل دریافت نبود. این موضوع به معنی نبود خبر یا اطلاعیه در کدال و سایر منابع نیست.`;
+  return [`پیام‌های ناظر مرتبط با ${symbol}`, '', ...news.slice(0, 8).map((n, i) => `${i + 1}) ${n.title}\n${n.date ? `تاریخ: ${n.date}\n` : ''}${n.text ? n.text.slice(0, 450) : ''}`)].join('\n\n');
 }
 
 function helpText() {
   return [
-    'دستیار اختیار معاملات — نسخه ۳.۲',
+    `دستیار اختیار معاملات | نسخه ${VERSION}`,
+    'همه گزارش‌ها به زبان ساده نوشته می‌شوند؛ کدهای داخلی API در گزارش معمولی نمایش داده نمی‌شوند.',
     '',
     '/start یا /help — راهنما',
-    '/market — دریافت داده خام زنجیره اختیار از TSETMC',
-    '/status — وضعیت سرویس و آخرین دریافت',
-    '/debug — نمایش مسیرها و کلیدهای رکوردهای دریافتی برای عیب‌یابی',
-    '/analyze نماد — درخواست بررسی نماد پایه',
-    '/scan — بررسی اولیه زنجیره اختیار',
-    '/news نماد — وضعیت منبع اخبار',
+    '/market — نمای کلی بازار اختیار',
+    '/scan — نمادهای دارای بیشترین گردش معاملات اختیار',
+    '/analyze نماد — تحلیل چندبخشی نماد پایه؛ مثال: /analyze فولاد',
+    '/chain نماد — فهرست قراردادهای اختیار نماد',
+    '/news نماد — پیام‌های ناظر مرتبط با نماد',
+    '/risk — سرمایه و حدود ریسک تنظیم‌شده',
+    '/status — وضعیت دریافت و موتورهای ربات',
+    '/debug — گزارش فنی کوتاه برای عیب‌یابی',
     '',
-    'نکته: تا وقتی فیلدهای قراردادها و ارتباط نماد پایه با قراردادها تأیید نشود، هیچ قیمت، تحلیل یا سیگنال حدسی ساخته نمی‌شود.'
+    'ربات سفارش خرید یا فروش ثبت نمی‌کند؛ فقط تحلیل و سناریو ارائه می‌دهد. در صورت داده ناکافی، نتیجه «عدم معامله» است.'
   ].join('\n');
 }
 
-async function handleCommand(chatId, text) {
-  const trimmed = (text || '').trim();
-  const [rawCommand, ...args] = trimmed.split(/\s+/);
-  const command = (rawCommand || '').split('@')[0].toLowerCase();
-  const symbol = args.join(' ').trim();
-
-  if (command === '/start' || command === '/help') return reply(chatId, helpText());
-  if (command === '/status') return reply(chatId, statusText());
-  if (command === '/market') {
-    await reply(chatId, 'در حال دریافت زنجیره اختیار از TSETMC...');
-    try {
-      const data = await getMarket(true);
-      const candidate = data.candidates[0];
-      return reply(chatId, [
-        'دریافت داده از TSETMC موفق بود.',
-        `تعداد رکورد در بزرگ‌ترین آرایه: ${data.count}`,
-        `مسیر آرایه: ${candidate ? candidate.path : 'تشخیص داده نشد'}`,
-        `کلیدهای نمونه: ${candidate ? candidate.keys.join(', ') : 'نامشخص'}`,
-        '',
-        'این عدد به‌تنهایی به معنی شناسایی قرارداد اختیار نیست. برای بررسی دقیق، دستور /debug را اجرا و خروجی آن را ارسال کن.'
-      ].join('\n'));
-    } catch (e) {
-      return reply(chatId, `خطا در دریافت TSETMC: ${e.message}`);
-    }
-  }
-  if (command === '/debug') return reply(chatId, debugText());
-  if (command === '/analyze') {
-    if (!symbol) return reply(chatId, 'نماد دارایی پایه را همراه دستور وارد کن. مثال: /analyze فولاد');
-    return reply(chatId, `نماد «${symbol}» دریافت شد. اما تحلیل متوقف است: هنوز نگاشت معتبر نماد پایه به قراردادهای اختیار و فیلدهای قیمت/سررسید تأیید نشده است. برای رفع خطا ابتدا /market و سپس /debug را اجرا کن. فعلاً سیگنال صادر نمی‌شود.`);
-  }
-  if (command === '/scan') {
-    try {
-      const data = await getMarket();
-      return reply(chatId, `دریافت داده انجام شد (${data.count} رکورد خام). اسکن کامل نشد، چون ساختار قراردادهای اختیار هنوز اعتبارسنجی نشده است. برای جلوگیری از سیگنال اشتباه، نتیجه «عدم معامله / داده ناکافی» است. دستور /debug را اجرا کن.`);
-    } catch (e) {
-      return reply(chatId, `اسکن متوقف شد؛ دریافت داده ناموفق بود: ${e.message}`);
-    }
-  }
-  if (command === '/news') {
-    if (!symbol) return reply(chatId, 'نماد را همراه دستور وارد کن. مثال: /news فولاد');
-    return reply(chatId, `نماد «${symbol}» دریافت شد؛ اما در این نسخه منبع خبری/پیام‌های ناظر به‌صورت عملیاتی متصل و راستی‌آزمایی نشده است. برای جلوگیری از خبرسازی، خبر یا اثر بنیادی گزارش نمی‌شود.`);
-  }
-  return reply(chatId, 'دستور شناخته نشد. برای دیدن دستورها /help را بزن.');
+function statusText() {
+  return [
+    `وضعیت دستیار: فعال | نسخه ${VERSION}`,
+    `شروع سرویس: ${STARTED_AT.toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' })}`,
+    `آخرین دریافت موفق زنجیره: ${lastMarketAt ? new Date(lastMarketAt).toLocaleString('fa-IR', { timeZone: 'Asia/Tehran' }) : 'هنوز دریافت نشده'}`,
+    `آخرین تعداد قرارداد شناسایی‌شده: ${lastMarket ? core.formatNumber(lastMarket.options.length) : 'نامشخص'}`,
+    `منبع آخرین دریافت: ${lastMarket?.source || 'هنوز دریافت نشده'}`,
+    `خطای آخر منبع: ${lastMarketError || 'ندارد'}`,
+    `تحلیل تکنیکال: ${lastMarket ? 'آماده اجرا، وابسته به دریافت تاریخچه سهم پایه' : 'در انتظار دریافت داده'}`,
+    `جریان حقیقی/حقوقی: اتصال در زمان تحلیل هر نماد` ,
+    `نرخ بدون ریسک برای یونانی‌ها: ${RISK_FREE_RATE == null ? 'تنظیم نشده؛ IV و یونانی‌ها غیرفعال' : `${core.formatNumber(RISK_FREE_RATE * 100, 2)}٪ سالانه (تنظیم دستی)`}`,
+    `سرمایه: ${core.formatNumber(CAPITAL_TOMAN)} تومان | ریسک هدف: ${core.formatNumber(RISK_PCT * 100, 2)}٪ | سقف سخت: ${core.formatNumber(MAX_RISK_PCT * 100, 2)}٪ | حداقل نسبت سود به زیان: ۱ به ${core.formatNumber(MIN_RR, 1)}`,
+    'ثبت سفارش خودکار: غیرفعال',
+  ].join('\n');
 }
 
-app.get('/', (_req, res) => res.type('text').send('Iran Options Assistant is running'));
-app.get('/health', (_req, res) => res.json({ ok: true, version: '3.2', uptime_seconds: Math.floor(process.uptime()) }));
+function debugText(market) {
+  if (!market) return `هنوز دریافت موفقی انجام نشده است. خطای آخر: ${lastMarketError || 'ندارد'}\nابتدا /market را اجرا کن.`;
+  const keys = market.selected?.keys || [];
+  const sample = market.selected?.rows?.[0] || {};
+  const recognizedFields = Object.keys(sample).slice(0, 45).map(k => `${k}: ${String(sample[k]).slice(0, 45)}`);
+  return [
+    'گزارش فنی برای بررسی مشکل',
+    `تعداد قراردادهای تبدیل‌شده: ${market.options.length}`,
+    `منبع داده: ${market.source || 'نامشخص'}`,
+    `آدرس منبع: ${market.sourceUrl || 'نامشخص'}`,
+    ...(market.diagnostics || []).map(x => `یادداشت منبع: ${x}`),
+    `مسیر آرایه: ${market.selected?.path || 'نامشخص'}`,
+    `تعداد رکورد آرایه: ${market.selected?.count || 0}`,
+    `کلیدهای اصلی: ${keys.join(', ')}`,
+    '', 'نمونه فیلدها:', ...recognizedFields,
+    '', 'این گزارش برای عیب‌یابی است؛ گزارش‌های عادی ربات کد فنی نمایش نمی‌دهند.'
+  ].join('\n').slice(0, 3800);
+}
+
+async function handleCommand(chatId, text) {
+  lastUpdateAt = new Date();
+  const parts = String(text || '').trim().split(/\s+/);
+  const command = (parts.shift() || '').split('@')[0].toLowerCase();
+  const symbol = parts.join(' ').trim();
+  if (command === '/start' || command === '/help') return reply(chatId, helpText());
+  if (command === '/status') return reply(chatId, statusText());
+  if (command === '/risk') return reply(chatId, [
+    `سرمایه مبنا: ${core.formatNumber(CAPITAL_TOMAN)} تومان`,
+    `ریسک هدف هر معامله: ${core.formatNumber(CAPITAL_TOMAN * RISK_PCT)} تومان (${core.formatNumber(RISK_PCT * 100, 2)}٪)`,
+    `سقف سخت ریسک: ${core.formatNumber(CAPITAL_TOMAN * MAX_RISK_PCT)} تومان (${core.formatNumber(MAX_RISK_PCT * 100, 2)}٪)`,
+    `حداقل سود به زیان: ۱ به ${core.formatNumber(MIN_RR, 1)}`,
+    'در خرید اختیار، کل وجه پرداختی می‌تواند از بین برود؛ تعداد قرارداد فقط وقتی پیشنهاد می‌شود که زیان برآوردی از بودجه ریسک بیشتر نشود.'
+  ].join('\n'));
+  if (command === '/market' || command === '/scan' || command === '/debug') {
+    await reply(chatId, command === '/debug' ? 'در حال آماده‌سازی گزارش فنی...' : 'در حال دریافت نمای بازار اختیار از سایت TSETMC / tse.ir...');
+    try {
+      const market = await getMarket(true);
+      if (command === '/market') return reply(chatId, buildMarketText(market));
+      if (command === '/scan') return reply(chatId, buildScanText(market));
+      return reply(chatId, debugText(market));
+    } catch (e) {
+      return reply(chatId, `دریافت بازار ناموفق بود.\nدلیل: ${e.message}\n\nتا رفع خطا سیگنال صادر نمی‌شود.`);
+    }
+  }
+  if (command === '/chain') {
+    if (!symbol) return reply(chatId, 'نام نماد پایه را بنویس. مثال: /chain فولاد');
+    try { const market = await getMarket(); return reply(chatId, buildChainText(symbol, market.options)); }
+    catch (e) { return reply(chatId, `دریافت زنجیره ناموفق بود: ${e.message}`); }
+  }
+  if (command === '/analyze') {
+    if (!symbol) return reply(chatId, 'نام نماد پایه را بنویس. مثال: /analyze فولاد');
+    await reply(chatId, `در حال بررسی سهم پایه، سابقه قیمت، جریان حقیقی/حقوقی، اطلاعیه‌ها و قراردادهای اختیار «${symbol}»...`);
+    try {
+      const result = await analyzeSymbol(symbol);
+      return reply(chatId, buildAnalysisText(result));
+    } catch (e) { return reply(chatId, `تحلیل کامل نشد: ${e.message}\n\nبرای جلوگیری از نتیجه اشتباه، فعلاً سیگنال صادر نمی‌شود.`); }
+  }
+  if (command === '/news') {
+    if (!symbol) return reply(chatId, 'نام نماد را بنویس. مثال: /news فولاد');
+    try {
+      const market = await getMarket();
+      const resolved = await resolveUnderlying(symbol, market);
+      if (!resolved.base?.code) return reply(chatId, `نماد «${symbol}» پیدا نشد.`);
+      const raw = await safeFetch(`/Msg/GetMsgByInsCode/${resolved.base.code}`);
+      if (raw.__error) return reply(chatId, `دریافت پیام ناظر ناموفق بود: ${raw.__error}`);
+      return reply(chatId, buildNewsText(symbol, core.extractMessages(raw)));
+    } catch (e) { return reply(chatId, `دریافت پیام‌ها ناموفق بود: ${e.message}`); }
+  }
+  return reply(chatId, 'این دستور را نمی‌شناسم. برای دیدن راهنما /help را بزن.');
+}
+
+app.get('/', (_req, res) => res.type('text').send(`Iran Options Assistant ${VERSION} is running`));
+app.get('/health', (_req, res) => res.json({ ok: true, version: VERSION, uptime_seconds: Math.floor(process.uptime()), last_market_at: lastMarketAt ? new Date(lastMarketAt).toISOString() : null, last_market_error: lastMarketError }));
 app.post('/telegram', async (req, res) => {
   if (SECRET && req.get('X-Telegram-Bot-Api-Secret-Token') !== SECRET) return res.sendStatus(401);
   res.sendStatus(200);
   const message = req.body && (req.body.message || req.body.edited_message);
   if (!message || !message.chat || !message.text) return;
+  const chatId = String(message.chat.id);
+  if (ALLOWED_CHAT_IDS.length && !ALLOWED_CHAT_IDS.includes(chatId)) return;
   try { await handleCommand(message.chat.id, message.text); }
-  catch (err) { console.error('Telegram handler error:', err.message); }
+  catch (err) { console.error('Telegram command failed:', err.message); }
 });
+app.use((err, _req, res, _next) => { console.error('HTTP error:', err.message); res.status(500).json({ ok: false, error: 'خطای داخلی سرویس' }); });
 
-app.listen(PORT, () => console.log(`Iran Options Assistant v3.2 running on ${PORT}`));
+if (require.main === module) {
+  if (!TOKEN) console.warn('WARNING: TELEGRAM_BOT_TOKEN is missing');
+  app.listen(PORT, () => console.log(`Iran Options Assistant v${VERSION} running on ${PORT}`));
+}
+
+module.exports = { app, analyzeSymbol, handleCommand, getMarket, buildAnalysisText, buildMarketText };
