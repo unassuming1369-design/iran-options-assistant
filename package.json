@@ -1,0 +1,17 @@
+{
+  "name": "iran-options-assistant",
+  "version": "5.1.0",
+  "private": true,
+  "description": "Iran options assistant with robust underlying resolution, position management and 60% entry budget",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node tests/selftest.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}
