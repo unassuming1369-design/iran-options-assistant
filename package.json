@@ -1,0 +1,17 @@
+{
+  "name": "iran-options-assistant",
+  "version": "5.0.0",
+  "private": true,
+  "description": "Persian Telegram options analysis, Codal/news research and manual/automatic position monitoring",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node tests/selftest.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

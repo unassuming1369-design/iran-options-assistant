@@ -1,0 +1,32 @@
+راهنمای نصب نسخه ۵.۰ دستیار اختیار معاملات
+
+۱) ابتدا از مخزن فعلی GitHub گزینه Code > Download ZIP را بزن و نسخه پشتیبان را نگه دار.
+۲) فایل iran_options_assistant_v5_0_complete.zip را استخراج کن.
+۳) وارد مخزن iran-options-assistant شو و Add file > Upload files را بزن.
+۴) فایل‌های زیر را در ریشه مخزن بارگذاری کن؛ فایل هم‌نام را جایگزین کن:
+- index.js
+- core.js
+- decision-center.js
+- package.json
+- README_FA.md
+- INSTALL_FA.txt
+- position-manager.js (جدید)
+- research-sources.js (جدید)
+- پوشه tests/ و فایل selftest.js داخل آن
+۵) فایل‌های دیگر مخزن را حذف نکن.
+۶) Commit changes را بزن و منتظر Deploy Render بمان.
+۷) متغیرهای TELEGRAM_BOT_TOKEN و WEBHOOK_SECRET را تغییر نده.
+۸) برای ماندگاری موقعیت‌ها، در Render یک Persistent Disk با Mount Path /var/data بساز و متغیر POSITION_DATA_DIR=/var/data را اضافه کن. بدون آن، موقعیت‌ها ممکن است با Restart/Deploy پاک شوند.
+۹) بعد از Deploy دستورات /status ، /market ، /research فولاد و /position list را آزمایش کن.
+
+نمونه ثبت موقعیت:
+/position add فولاد نمادقرارداد call long 10000 1405/12/20 850 5
+
+ترتیب فیلدها: نماد پایه، نماد دقیق قرارداد، call یا put، long یا short، قیمت اعمال، سررسید، قیمت ورود به تومان، تعداد. اندازه قرارداد از زنجیره خوانده می‌شود.
+
+بررسی دستی: /position check یا /position check شناسه
+فهرست: /position list
+بستن پرونده داخلی: /position close شناسه
+جست‌وجوی خبر و کدال: /research فولاد
+
+ربات فقط تحلیل و هشدار می‌دهد و هیچ سفارشی ثبت یا تغییر نمی‌دهد. پایش خودکار وابسته به روشن‌بودن Render و دریافت داده زنده است.
